@@ -16,9 +16,9 @@ function getLocaleFromCookie(): string {
   if (typeof document === "undefined") return "en-US";
   
   // Map frontend locale codes to backend locale format
-  // Frontend uses: "en", "zh"
-  // Backend expects: "en-US", "zh-CN"
-  const LOCALE_MAP = { "en": "en-US", "zh": "zh-CN" } as const;
+  // Frontend uses: "en", "zh", "ko"
+  // Backend expects: "en-US", "zh-CN", "ko-KR"
+  const LOCALE_MAP = { "en": "en-US", "zh": "zh-CN", "ko": "ko-KR" } as const;
   
   // Initialize to raw locale format (matches cookie format)
   let rawLocale = "en";

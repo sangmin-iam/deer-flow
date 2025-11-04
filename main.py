@@ -10,7 +10,7 @@ import asyncio
 
 from InquirerPy import inquirer
 
-from src.config.questions import BUILT_IN_QUESTIONS, BUILT_IN_QUESTIONS_ZH_CN
+from src.config.questions import BUILT_IN_QUESTIONS, BUILT_IN_QUESTIONS_ZH_CN, BUILT_IN_QUESTIONS_KO_KR
 from src.workflow import run_agent_workflow_async
 
 
@@ -67,33 +67,36 @@ def main(
     """
     # First select language
     language = inquirer.select(
-        message="Select language / 选择语言:",
-        choices=["English", "中文"],
+        message="Select language / 选择语言 / 언어 선택:",
+        choices=["English", "中文", "한국어"],
     ).execute()
 
     # Choose questions based on language
-    questions = (
-        BUILT_IN_QUESTIONS if language == "English" else BUILT_IN_QUESTIONS_ZH_CN
-    )
-    ask_own_option = (
-        "[Ask my own question]" if language == "English" else "[自定义问题]"
-    )
+    if language == "English":
+        questions = BUILT_IN_QUESTIONS
+        ask_own_option = "[Ask my own question]"
+    elif language == "中文":
+        questions = BUILT_IN_QUESTIONS_ZH_CN
+        ask_own_option = "[自定义问题]"
+    else:  # 한국어
+        questions = BUILT_IN_QUESTIONS_KO_KR
+        ask_own_option = "[직접 질문하기]"
 
     # Select a question
+    question_prompt = {
+        "English": "What do you want to know?",
+        "中文": "您想了解什么?",
+        "한국어": "무엇을 알고 싶으신가요?"
+    }
+    
     initial_question = inquirer.select(
-        message=(
-            "What do you want to know?" if language == "English" else "您想了解什么?"
-        ),
+        message=question_prompt[language],
         choices=[ask_own_option] + questions,
     ).execute()
 
     if initial_question == ask_own_option:
         initial_question = inquirer.text(
-            message=(
-                "What do you want to know?"
-                if language == "English"
-                else "您想了解什么?"
-            ),
+            message=question_prompt[language],
         ).execute()
 
     # Pass all parameters to ask function
