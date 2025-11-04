@@ -24,6 +24,7 @@ type LanguageOption = {
 const languages: Array<LanguageOption> = [
   { code: "en", name: "English", flag: "🇺🇸" },
   { code: "zh", name: "中文", flag: "🇨🇳" },
+  { code: "ko", name: "한국어", flag: "🇰🇷" },
 ];
 
 export function LanguageSwitcher() {
@@ -37,7 +38,7 @@ export function LanguageSwitcher() {
 
   const handleLanguageChange = (newLocale: string) => {
     startTransition(() => {
-      console.log(`updateing locale to ${newLocale}`)
+      console.log(`updateing locale to ${newLocale}`);
       // Set locale in cookie
       document.cookie = `NEXT_LOCALE=${newLocale}; path=/; max-age=31536000; SameSite=lax`;
       // Reload the page to apply the new locale

@@ -5,7 +5,7 @@ import { cookies } from "next/headers";
 import { getRequestConfig } from "next-intl/server";
 
 // Can be imported from a shared config
-const locales: Array<string> = ["zh", "en"];
+const locales: Array<string> = ["zh", "en", "ko"];
 
 export default getRequestConfig(async () => {
   // Get locale from cookie
