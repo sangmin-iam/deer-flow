@@ -21,6 +21,7 @@ from .types import State
 
 def continue_to_running_research_team(state: State):
     current_plan = state.get("current_plan")
+    print('current_plan: ', current_plan)
     if not current_plan or not current_plan.steps:
         return "planner"
 
@@ -44,8 +45,11 @@ def continue_to_running_research_team(state: State):
     return "planner"
 
 
+# 한국어: 노드와 엣지를 추가하여 기본 상태 그래프를 구성하는 함수
 def _build_base_graph():
     """Build and return the base state graph with all nodes and edges."""
+
+    # 그래프 상태 클래스 인스턴스 생성 (모든 노드가 이 상태를 저장하고 공유하는 공통 상태 클래스)
     builder = StateGraph(State)
     builder.add_edge(START, "coordinator")
     builder.add_node("coordinator", coordinator_node)

@@ -103,18 +103,21 @@ graph = build_graph_with_memory()
 
 @app.post("/api/chat/stream")
 async def chat_stream(request: ChatRequest):
-    # Check if MCP server configuration is enabled
+    # 영문: Check if MCP server configuration is enabled
+    # 한국어: MCP 서버 설정이 활성화되어 있는지 확인합니다.
     mcp_enabled = get_bool_env("ENABLE_MCP_SERVER_CONFIGURATION", False)
 
     logger.debug(f"get the request locale : {request.locale}")
 
-    # Validate MCP settings if provided
+    # 영문: Validate MCP settings if provided
+    # 한국어: MCP 설정이 제공되었는지 확인합니다.
     if request.mcp_settings and not mcp_enabled:
         raise HTTPException(
             status_code=403,
             detail="MCP server configuration is disabled. Set ENABLE_MCP_SERVER_CONFIGURATION=true to enable MCP features.",
         )
 
+    # 한국어: 요청에서 스레드 ID를 가져옵니다.
     thread_id = request.thread_id
     if thread_id == "__default__":
         thread_id = str(uuid4())
@@ -441,11 +444,40 @@ async def _process_message_chunk(message_chunk, message_metadata, thread_id, age
 async def _stream_graph_events(
     graph_instance, workflow_input, workflow_config, thread_id
 ):
-    """Stream events from the graph and process them."""
-    safe_thread_id = sanitize_thread_id(thread_id)
+    """
+    LangGraph 이벤트를 SSE 형식으로 변환하는 어댑터 함수
+
+    역할:
+    - LangGraph의 원시 이벤트 스트림을 받아서
+    - 클라이언트가 이해할 수 있는 SSE 이벤트로 변환
+    - interrupt, 메시지 청크, 에러 등을 처리
+
+    Args:
+        graph_instance: 실행할 LangGraph 인스턴스
+        workflow_input: State 초기값 (messages, plan_iterations 등)
+        workflow_config: 그래프 실행 설정 (max_iterations, thread_id 등)
+        thread_id: 대화 세션 ID
+
+    Yields:
+        SSE 형식의 이벤트 문자열 ("event: xxx\ndata: {...}\n\n")
+    """
+    # ========================================
+    # 1. 준비 단계: 로깅 및 초기화
+    # ========================================
+    safe_thread_id = sanitize_thread_id(thread_id)  # 로그 인젝션 방지
     logger.debug(f"[{safe_thread_id}] Starting graph event stream with agent nodes")
+
     try:
-        event_count = 0
+        event_count = 0  # 디버깅용 이벤트 카운터
+
+        # ========================================
+        # 2. LangGraph 실행 시작 (핵심!)
+        # ========================================
+        # astream(): LangGraph를 비동기로 실행하고 이벤트를 스트리밍
+        # - workflow_input: State 초기값
+        # - config: 실행 설정 (읽기 전용)
+        # - stream_mode: ["messages", "updates"] 두 타입의 이벤트 수신
+        # - subgraphs: 서브그래프(research_team 등) 이벤트도 포함
         async for agent, _, event_data in graph_instance.astream(
             workflow_input,
             config=workflow_config,
@@ -455,39 +487,82 @@ async def _stream_graph_events(
             event_count += 1
             safe_agent = sanitize_agent_name(agent)
             logger.debug(f"[{safe_thread_id}] Graph event #{event_count} received from agent: {safe_agent}")
-            
+
+            # ========================================
+            # 3. 이벤트 타입 분기: Dict vs Tuple
+            # ========================================
+            # LangGraph는 두 가지 타입의 이벤트를 반환:
+            # - Dict: State 업데이트 (stream_mode="updates")
+            # - Tuple: 메시지 청크 (stream_mode="messages")
+
+            # 📌 분기 1: Dict 타입 = State 업데이트 이벤트
             if isinstance(event_data, dict):
+                # ========================================
+                # 3-1. Interrupt 이벤트 처리
+                # ========================================
+                # __interrupt__ 키가 있으면 사용자 승인이 필요한 중단점
+                # 예: 플래너가 계획을 세우고 사용자에게 검토 요청
                 if "__interrupt__" in event_data:
                     logger.debug(
                         f"[{safe_thread_id}] Processing interrupt event: "
                         f"ns={getattr(event_data['__interrupt__'][0], 'ns', 'unknown') if isinstance(event_data['__interrupt__'], (list, tuple)) and len(event_data['__interrupt__']) > 0 else 'unknown'}, "
                         f"value_len={len(getattr(event_data['__interrupt__'][0], 'value', '')) if isinstance(event_data['__interrupt__'], (list, tuple)) and len(event_data['__interrupt__']) > 0 and hasattr(event_data['__interrupt__'][0], 'value') and hasattr(event_data['__interrupt__'][0].value, '__len__') else 'unknown'}"
                     )
+                    # interrupt 이벤트를 생성하여 클라이언트로 전송
+                    # 클라이언트는 이를 받아 "승인/거부" 버튼을 표시
                     yield _create_interrupt_event(thread_id, event_data)
-                logger.debug(f"[{safe_thread_id}] Dict event without interrupt, skipping")
-                continue
 
+                # 일반 State 업데이트는 무시 (현재는 interrupt만 처리)
+                logger.debug(f"[{safe_thread_id}] Dict event without interrupt, skipping")
+                continue  # 다음 이벤트로
+
+            # 📌 분기 2: Tuple 타입 = 메시지 청크 이벤트
+            # ========================================
+            # 3-2. 메시지 청크 처리
+            # ========================================
+            # Tuple 구조: (BaseMessage, metadata)
+            # - BaseMessage: AIMessageChunk, ToolMessage, HumanMessage 등
+            # - metadata: {"langgraph_node": "researcher", "langgraph_step": 3}
             message_chunk, message_metadata = cast(
                 tuple[BaseMessage, dict[str, Any]], event_data
             )
-            
+
+            # 로깅용 정보 추출 (보안 처리)
             safe_node = sanitize_agent_name(message_metadata.get('langgraph_node', 'unknown'))
             safe_step = sanitize_log_input(message_metadata.get('langgraph_step', 'unknown'))
             logger.debug(
                 f"[{safe_thread_id}] Processing message chunk: "
-                f"type={type(message_chunk).__name__}, "
-                f"node={safe_node}, "
-                f"step={safe_step}"
+                f"type={type(message_chunk).__name__}, "  # AIMessageChunk, ToolMessage 등
+                f"node={safe_node}, "  # 어느 노드에서 왔는지
+                f"step={safe_step}"    # 몇 번째 스텝인지
             )
 
+            # ========================================
+            # 4. 메시지 청크를 SSE 이벤트로 변환
+            # ========================================
+            # _process_message_chunk()가 메시지 타입에 따라 변환:
+            # - AIMessageChunk → "message_chunk" 이벤트 (실시간 텍스트)
+            # - ToolMessage → "tool_call_result" 이벤트 (도구 실행 결과)
+            # - AIMessage with tool_calls → "tool_calls" 이벤트 (도구 호출 정보)
             async for event in _process_message_chunk(
                 message_chunk, message_metadata, thread_id, agent
             ):
-                yield event
+                yield event  # 클라이언트로 SSE 이벤트 전송
         
+        # ========================================
+        # 5. 정상 종료
+        # ========================================
         logger.debug(f"[{safe_thread_id}] Graph event stream completed. Total events: {event_count}")
+        
+    # ========================================
+    # 6. 에러 처리
+    # ========================================
     except Exception as e:
+        # LangGraph 실행 중 에러 발생 시
         logger.exception(f"[{safe_thread_id}] Error during graph execution")
+        
+        # 에러 이벤트를 클라이언트로 전송
+        # 클라이언트는 이를 받아 에러 메시지를 표시
         yield _make_event(
             "error",
             {
@@ -515,6 +590,7 @@ async def _astream_workflow_generator(
     locale: str = "en-US",
     interrupt_before_tools: Optional[List[str]] = None,
 ):
+    # 로깅을 안전하게 하기 위해 사용
     safe_thread_id = sanitize_thread_id(thread_id)
     safe_feedback = sanitize_log_input(interrupt_feedback) if interrupt_feedback else ""
     logger.debug(
@@ -524,8 +600,12 @@ async def _astream_workflow_generator(
         f"interrupt_feedback={safe_feedback}, "
         f"interrupt_before_tools={interrupt_before_tools}"
     )
-    
+
     # Process initial messages
+    # 초기 메시지가 있는 경우 처리 (ex. 체크포인트 복구 시 이전 메시지 전송)
+    # - 체크포인트란 대화의 중간 상태를 저장하고 복구하는 기능을 의미합니다.
+    # - 체크포인트를 저장하는 방법에는 데이터베이스(PostgreSQL, MongoDB)와 메모리 기반(in-memory) 두 가지가 있습니다.
+    # - 현재는 체크 포인트를 사용하고 있지 않습니다.
     logger.debug(f"[{safe_thread_id}] Processing {len(messages)} initial messages")
     for message in messages:
         if isinstance(message, dict) and "content" in message:

@@ -47,6 +47,8 @@ export async function* fetchStream(
       }
 
       buffer += value;
+      console.log(done);
+      console.log(value);
 
       // Check buffer size to avoid memory overflow
       if (buffer.length > MAX_BUFFER_SIZE) {

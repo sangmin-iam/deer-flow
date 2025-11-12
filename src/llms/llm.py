@@ -51,6 +51,11 @@ def _get_env_llm_conf(llm_type: str) -> Dict[str, Any]:
 
 def _create_llm_use_conf(llm_type: LLMType, conf: Dict[str, Any]) -> BaseChatModel:
     """Create LLM instance using configuration."""
+    # ============================================================
+    # 1. LLM 설정 키 가져오기 및 검증
+    # - llm_type에 해당하는 설정 키를 조회
+    # - 설정 파일(config.yaml)에서 해당 LLM의 설정을 추출
+    # ============================================================
     llm_type_config_keys = _get_llm_type_config_keys()
     config_key = llm_type_config_keys.get(llm_type)
 
@@ -61,59 +66,82 @@ def _create_llm_use_conf(llm_type: LLMType, conf: Dict[str, Any]) -> BaseChatMod
     if not isinstance(llm_conf, dict):
         raise ValueError(f"Invalid LLM configuration for {llm_type}: {llm_conf}")
 
-    # Get configuration from environment variables
+    # ============================================================
+    # 2. 환경 변수 설정 병합
+    # - 환경 변수에서 LLM 설정을 가져옴
+    # - 파일 설정과 환경 변수 설정을 병합 (환경 변수가 우선)
+    # - 불필요한 파라미터 제거 (token_limit 등)
+    # ============================================================
     env_conf = _get_env_llm_conf(llm_type)
 
-    # Merge configurations, with environment variables taking precedence
+    # 설정 병합: 환경 변수가 우선순위를 가짐
     merged_conf = {**llm_conf, **env_conf}
 
-    # Remove unnecessary parameters when initializing the client
+    # 클라이언트 초기화 시 불필요한 파라미터 제거
     if "token_limit" in merged_conf:
         merged_conf.pop("token_limit")
 
     if not merged_conf:
         raise ValueError(f"No configuration found for LLM type: {llm_type}")
 
-    # Add max_retries to handle rate limit errors
+    # ============================================================
+    # 3. 재시도 및 SSL 검증 설정
+    # - max_retries: Rate limit 오류 처리를 위한 재시도 횟수 설정
+    # - SSL 검증 비활성화 시 커스텀 HTTP 클라이언트 생성
+    # ============================================================
+    # Rate limit 오류 처리를 위한 재시도 설정 추가
     if "max_retries" not in merged_conf:
         merged_conf["max_retries"] = 3
 
-    # Handle SSL verification settings
+    # SSL 검증 설정 처리
     verify_ssl = merged_conf.pop("verify_ssl", True)
 
-    # Create custom HTTP client if SSL verification is disabled
+    # SSL 검증이 비활성화된 경우 커스텀 HTTP 클라이언트 생성
     if not verify_ssl:
         http_client = httpx.Client(verify=False)
         http_async_client = httpx.AsyncClient(verify=False)
         merged_conf["http_client"] = http_client
         merged_conf["http_async_client"] = http_async_client
 
-    # Check if it's Google AI Studio platform based on configuration
+    # ============================================================
+    # 4. 플랫폼별 LLM 인스턴스 생성 - Google AI Studio
+    # - Google AI Studio (Gemini) 플랫폼 감지
+    # - Google 특화 설정으로 변환 (api_key → google_api_key)
+    # - Google AI Studio에서 지원하지 않는 파라미터 제거
+    # ============================================================
     platform = merged_conf.get("platform", "").lower()
     is_google_aistudio = platform == "google_aistudio" or platform == "google-aistudio"
 
     if is_google_aistudio:
-        # Handle Google AI Studio specific configuration
+        # Google AI Studio 전용 설정 처리
         gemini_conf = merged_conf.copy()
 
-        # Map common keys to Google AI Studio specific keys
+        # 공통 키를 Google AI Studio 전용 키로 매핑
         if "api_key" in gemini_conf:
             gemini_conf["google_api_key"] = gemini_conf.pop("api_key")
 
-        # Remove base_url and platform since Google AI Studio doesn't use them
+        # Google AI Studio에서 사용하지 않는 파라미터 제거
         gemini_conf.pop("base_url", None)
         gemini_conf.pop("platform", None)
 
-        # Remove unsupported parameters for Google AI Studio
+        # Google AI Studio에서 지원하지 않는 파라미터 제거
         gemini_conf.pop("http_client", None)
         gemini_conf.pop("http_async_client", None)
 
         return ChatGoogleGenerativeAI(**gemini_conf)
 
+    # ============================================================
+    # 5. 플랫폼별 LLM 인스턴스 생성 - Azure OpenAI
+    # - Azure 엔드포인트 감지 시 AzureChatOpenAI 반환
+    # ============================================================
     if "azure_endpoint" in merged_conf or os.getenv("AZURE_OPENAI_ENDPOINT"):
         return AzureChatOpenAI(**merged_conf)
 
-    # Check if base_url is dashscope endpoint
+    # ============================================================
+    # 6. 플랫폼별 LLM 인스턴스 생성 - Dashscope (Alibaba Cloud)
+    # - base_url에서 dashscope 감지
+    # - reasoning 타입일 경우 thinking 기능 활성화
+    # ============================================================
     if "base_url" in merged_conf and "dashscope." in merged_conf["base_url"]:
         if llm_type == "reasoning":
             merged_conf["extra_body"] = {"enable_thinking": True}
@@ -121,10 +149,17 @@ def _create_llm_use_conf(llm_type: LLMType, conf: Dict[str, Any]) -> BaseChatMod
             merged_conf["extra_body"] = {"enable_thinking": False}
         return ChatDashscope(**merged_conf)
 
+    # ============================================================
+    # 7. 플랫폼별 LLM 인스턴스 생성 - DeepSeek 및 기본 OpenAI
+    # - reasoning 타입: DeepSeek 사용 (추론 특화 모델)
+    # - 기타: 표준 OpenAI API 호환 모델 사용
+    # ============================================================
     if llm_type == "reasoning":
+        # DeepSeek는 base_url 대신 api_base 파라미터 사용
         merged_conf["api_base"] = merged_conf.pop("base_url", None)
         return ChatDeepSeek(**merged_conf)
     else:
+        # 기본: OpenAI 호환 클라이언트 반환
         return ChatOpenAI(**merged_conf)
 
 

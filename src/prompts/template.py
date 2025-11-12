@@ -61,27 +61,50 @@ def apply_prompt_template(
     Returns:
         List of messages with the system prompt as the first message
     """
-    # Convert state to dict for template rendering
+    # ============================================================
+    # 1. 상태 변수 준비
+    # - state를 딕셔너리로 변환하여 템플릿 렌더링에 사용
+    # - CURRENT_TIME: 현재 시간을 템플릿 변수로 추가
+    # - state의 모든 값을 템플릿 변수로 사용 가능하게 함
+    # ============================================================
     state_vars = {
         "CURRENT_TIME": datetime.now().strftime("%a %b %d %Y %H:%M:%S %z"),
         **state,
     }
 
-    # Add configurable variables
+    # ============================================================
+    # 2. 추가 설정 변수 병합
+    # - Configuration 객체의 값들을 템플릿 변수에 추가
+    # - resources, max_search_results 등의 설정값 포함
+    # ============================================================
     if configurable:
         state_vars.update(dataclasses.asdict(configurable))
 
     try:
-        # Normalize locale format
+        # ============================================================
+        # 3. Locale 정규화 및 템플릿 로드
+        # - Locale 형식 정규화 (en-US → en_US)
+        # - 다국어 지원: 해당 Locale의 템플릿 우선 시도
+        # - 폴백: Locale 템플릿이 없으면 영어 템플릿 사용
+        # ============================================================
+        # Locale 형식 정규화 (하이픈을 언더스코어로 변환)
         normalized_locale = locale.replace("-", "_") if locale and locale.strip() else "en_US"
         
-        # Try locale-specific template first
+        # Locale별 템플릿 로드 시도
         try:
+            # 예: coordinator.ko_KR.md, planner.zh_CN.md
             template = env.get_template(f"{prompt_name}.{normalized_locale}.md")
         except TemplateNotFound:
-            # Fallback to English template
+            # Locale 템플릿이 없으면 기본 영어 템플릿 사용
+            # 예: coordinator.md, planner.md
             template = env.get_template(f"{prompt_name}.md")
         
+        # ============================================================
+        # 4. 템플릿 렌더링 및 메시지 구성
+        # - Jinja2 템플릿에 state_vars를 적용하여 렌더링
+        # - 시스템 프롬프트를 첫 번째 메시지로 추가
+        # - 기존 대화 메시지들을 그 다음에 연결
+        # ============================================================
         system_prompt = template.render(**state_vars)
         return [{"role": "system", "content": system_prompt}] + state["messages"]
     except Exception as e:

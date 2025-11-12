@@ -437,15 +437,29 @@ def coordinator_node(
     logger.info("Coordinator talking.")
     configurable = Configuration.from_runnable_config(config)
 
-    # Check if clarification is enabled
+    # ============================================================
+    # 초기화: 명확화(Clarification) 설정 및 연구 주제 로드
+    # - enable_clarification: 명확화 기능 활성화 여부 확인
+    # - initial_topic: 사용자의 초기 연구 주제
+    # - clarified_topic: 명확화 과정을 거친 후의 정제된 주제
+    # ============================================================
     enable_clarification = state.get("enable_clarification", False)
+    print('===============================================')
+    print('enable_clarification: ', enable_clarification)
+    print('===============================================')
     initial_topic = state.get("research_topic", "")
+    print('===============================================')
+    print('initial_topic: ', initial_topic)
+    print('===============================================')
     clarified_topic = initial_topic
     # ============================================================
-    # BRANCH 1: Clarification DISABLED (Legacy Mode)
+    # BRANCH 1: 명확화 비활성화 (레거시 모드)
+    # - 기존 동작 방식: 사용자 질의를 그대로 planner에게 전달
+    # - 추가 질문 없이 즉시 handoff_to_planner 도구 호출
+    # - 빠른 응답이 필요하거나 명확화가 불필요한 경우 사용
     # ============================================================
     if not enable_clarification:
-        # Use normal prompt with explicit instruction to skip clarification
+        # 명확화 생략을 명시적으로 지시하는 시스템 메시지 추가
         messages = apply_prompt_template("coordinator", state, locale=state.get("locale", "en-US"))
         messages.append(
             {
@@ -454,7 +468,7 @@ def coordinator_node(
             }
         )
 
-        # Only bind handoff_to_planner tool
+        # handoff_to_planner 도구만 바인딩 (다른 도구는 사용 불가)
         tools = [handoff_to_planner]
         response = (
             get_llm_by_type(AGENT_LLM_MAP["coordinator"])
@@ -462,12 +476,18 @@ def coordinator_node(
             .invoke(messages)
         )
 
+        print('===============================================')
+        print('response: ', response)
+        print('===============================================')
+
         goto = "__end__"
         locale = state.get("locale", "en-US")
         logger.info(f"Coordinator locale: {locale}")
         research_topic = state.get("research_topic", "")
 
-        # Process tool calls for legacy mode
+        # 레거시 모드: 도구 호출 처리
+        # - handoff_to_planner가 호출되면 planner로 이동
+        # - research_topic 추출 및 업데이트
         if response.tool_calls:
             try:
                 for tool_call in response.tool_calls:
@@ -478,7 +498,7 @@ def coordinator_node(
                         logger.info("Handing off to planner")
                         goto = "planner"
 
-                        # Extract research_topic if provided
+                        # 도구 인자에서 research_topic 추출
                         if tool_args.get("research_topic"):
                             research_topic = tool_args.get("research_topic")
                         break
@@ -488,19 +508,28 @@ def coordinator_node(
                 goto = "planner"
 
     # ============================================================
-    # BRANCH 2: Clarification ENABLED (New Feature)
+    # BRANCH 2: 명확화 활성화 (새로운 기능)
+    # - 사용자와 대화를 통해 연구 주제를 명확하게 정제
+    # - 최대 N번(기본 3번)의 명확화 라운드를 거침
+    # - 불명확한 요청을 구체적이고 실행 가능한 주제로 변환
     # ============================================================
     else:
-        # Load clarification state
+        # 명확화 상태 로드
+        # - clarification_rounds: 현재까지 진행된 명확화 라운드 수
+        # - clarification_history: 사용자의 응답 기록
+        # - max_clarification_rounds: 최대 허용 라운드 수
         clarification_rounds = state.get("clarification_rounds", 0)
         clarification_history = list(state.get("clarification_history", []) or [])
         clarification_history = [item for item in clarification_history if item]
         max_clarification_rounds = state.get("max_clarification_rounds", 3)
 
-        # Prepare the messages for the coordinator
+        # Coordinator를 위한 메시지 준비
         state_messages = list(state.get("messages", []))
         messages = apply_prompt_template("coordinator", state, locale=state.get("locale", "en-US"))
 
+        # 명확화 이력 재구성 및 정제된 주제 생성
+        # - 기존 메시지에서 사용자 응답 추출
+        # - 누적된 응답으로부터 완전한 연구 주제 구축
         clarification_history = reconstruct_clarification_history(
             state_messages, clarification_history, initial_topic
         )
@@ -515,7 +544,7 @@ def coordinator_node(
         else:
             latest_user_content = ""
 
-        # Add clarification status for first round
+        # 첫 번째 라운드: 명확화 모드 활성화 안내
         if clarification_rounds == 0:
             messages.append(
                 {
@@ -524,6 +553,7 @@ def coordinator_node(
                 }
             )
 
+        # 현재 명확화 상태 로깅
         current_response = latest_user_content or "No response"
         logger.info(
             "Clarification round %s/%s | topic: %s | current user response: %s",
@@ -533,22 +563,26 @@ def coordinator_node(
             current_response,
         )
 
+        # 명확화 컨텍스트 추가: LLM에게 현재 라운드 정보 제공
         clarification_context = f"""Continuing clarification (round {clarification_rounds}/{max_clarification_rounds}):
             User's latest response: {current_response}
             Ask for remaining missing dimensions. Do NOT repeat questions or start new topics."""
 
         messages.append({"role": "system", "content": clarification_context})
 
-        # Bind both clarification tools - let LLM choose the appropriate one
+        # 명확화 도구 바인딩
+        # - handoff_to_planner: 일반 handoff
+        # - handoff_after_clarification: 명확화 완료 후 handoff
+        # LLM이 상황에 맞는 도구를 선택
         tools = [handoff_to_planner, handoff_after_clarification]
 
-        # Check if we've already reached max rounds
+        # 최대 라운드 도달 여부 확인
         if clarification_rounds >= max_clarification_rounds:
-            # Max rounds reached - force handoff by adding system instruction
+            # 최대 라운드 도달 시 강제로 handoff 실행
             logger.warning(
                 f"Max clarification rounds ({max_clarification_rounds}) reached. Forcing handoff to planner. Using prepared clarified topic: {clarified_topic}"
             )
-            # Add system instruction to force handoff - let LLM choose the right tool
+            # LLM에게 명확화 종료 및 handoff 지시
             messages.append(
                 {
                     "role": "system",
@@ -556,6 +590,7 @@ def coordinator_node(
                 }
             )
 
+        # LLM 호출: 명확화 질문 생성 또는 handoff 결정
         response = (
             get_llm_by_type(AGENT_LLM_MAP["coordinator"])
             .bind_tools(tools)
@@ -563,7 +598,7 @@ def coordinator_node(
         )
         logger.debug(f"Current state messages: {state['messages']}")
 
-        # Initialize response processing variables
+        # 응답 처리를 위한 변수 초기화
         goto = "__end__"
         locale = state.get("locale", "en-US")
         research_topic = (
@@ -574,32 +609,38 @@ def coordinator_node(
         if not clarified_topic:
             clarified_topic = research_topic
 
-        # --- Process LLM response ---
-        # No tool calls - LLM is asking a clarifying question
+        # ============================================================
+        # LLM 응답 처리: 명확화 질문 vs Handoff 결정
+        # ============================================================
+
+        # 케이스 1: 도구 호출 없음 - LLM이 명확화 질문을 하는 경우
         if not response.tool_calls and response.content:
-            # Check if we've reached max rounds - if so, force handoff to planner
+            # 최대 라운드 도달 확인
             if clarification_rounds >= max_clarification_rounds:
+                # 최대 라운드 도달했지만 LLM이 handoff를 호출하지 않음
+                # 강제로 planner로 이동
                 logger.warning(
                     f"Max clarification rounds ({max_clarification_rounds}) reached. "
                     "LLM didn't call handoff tool, forcing handoff to planner."
                 )
                 goto = "planner"
-                # Continue to final section instead of early return
+                # 최종 섹션으로 계속 진행
             else:
-                # Continue clarification process
+                # 명확화 프로세스 계속: 사용자 응답 대기
                 clarification_rounds += 1
-                # Do NOT add LLM response to clarification_history - only user responses
+                # 주의: LLM 응답은 clarification_history에 추가하지 않음 (사용자 응답만 추가)
                 logger.info(
                     f"Clarification response: {clarification_rounds}/{max_clarification_rounds}: {response.content}"
                 )
 
-                # Append coordinator's question to messages
+                # Coordinator의 질문을 메시지에 추가
                 updated_messages = list(state_messages)
                 if response.content:
                     updated_messages.append(
                         HumanMessage(content=response.content, name="coordinator")
                     )
 
+                # 명확화 진행 중: 사용자 입력 대기를 위해 interrupt와 함께 반환
                 return Command(
                     update={
                         "messages": updated_messages,
@@ -616,36 +657,42 @@ def coordinator_node(
                     goto=goto,
                 )
         else:
-            # LLM called a tool (handoff) or has no content - clarification complete
+            # 케이스 2: 도구 호출 있음 또는 내용 없음 - 명확화 완료
             if response.tool_calls:
                 logger.info(
                     f"Clarification completed after {clarification_rounds} rounds. LLM called handoff tool."
                 )
             else:
                 logger.warning("LLM response has no content and no tool calls.")
-            # goto will be set in the final section based on tool calls
+            # goto는 최종 섹션에서 도구 호출을 기반으로 설정됨
 
     # ============================================================
-    # Final: Build and return Command
+    # Final: 최종 Command 생성 및 반환
+    # - 두 브랜치(레거시/명확화) 모두에 대한 통합 처리
+    # - 다음 노드로의 라우팅 결정
+    # - 상태 업데이트 및 반환
     # ============================================================
     messages = list(state.get("messages", []) or [])
     if response.content:
         messages.append(HumanMessage(content=response.content, name="coordinator"))
 
-    # Process tool calls for BOTH branches (legacy and clarification)
+    # 도구 호출 처리: 레거시 및 명확화 브랜치 모두에 적용
     if response.tool_calls:
         try:
             for tool_call in response.tool_calls:
                 tool_name = tool_call.get("name", "")
                 tool_args = tool_call.get("args", {})
 
+                # handoff 도구가 호출된 경우
                 if tool_name in ["handoff_to_planner", "handoff_after_clarification"]:
                     logger.info("Handing off to planner")
                     goto = "planner"
 
+                    # 레거시 모드: research_topic 추출
                     if not enable_clarification and tool_args.get("research_topic"):
                         research_topic = tool_args["research_topic"]
 
+                    # 로깅: 어떤 주제를 사용하는지 명확히 표시
                     if enable_clarification:
                         logger.info(
                             "Using prepared clarified topic: %s",
@@ -661,29 +708,33 @@ def coordinator_node(
             logger.error(f"Error processing tool calls: {e}")
             goto = "planner"
     else:
-        # No tool calls detected - fallback to planner instead of ending
+        # 도구 호출이 없는 경우: planner로 폴백하여 워크플로 계속 진행
         logger.warning(
             "LLM didn't call any tools. This may indicate tool calling issues with the model. "
             "Falling back to planner to ensure research proceeds."
         )
-        # Log full response for debugging
+        # 디버깅을 위한 응답 로깅
         logger.debug(f"Coordinator response content: {response.content}")
         logger.debug(f"Coordinator response object: {response}")
-        # Fallback to planner to ensure workflow continues
         goto = "planner"
 
-    # Apply background_investigation routing if enabled (unified logic)
+    # 배경 조사(Background Investigation) 라우팅 적용
+    # planner로 이동 예정이고 배경 조사가 활성화된 경우
+    # background_investigator로 먼저 라우팅
     if goto == "planner" and state.get("enable_background_investigation"):
         goto = "background_investigator"
 
-    # Set default values for state variables (in case they're not defined in legacy mode)
+    # 레거시 모드: 명확화 관련 상태 변수의 기본값 설정
     if not enable_clarification:
         clarification_rounds = 0
         clarification_history = []
 
+    # 최종 연구 주제: 명확화된 주제 또는 원본 주제
     clarified_research_topic_value = clarified_topic or research_topic
 
-    # clarified_research_topic: Complete clarified topic with all clarification rounds
+    # Command 반환: 상태 업데이트 및 다음 노드로 이동
+    # - clarified_research_topic: 모든 명확화 라운드를 거친 완전한 주제
+    # - is_clarification_complete: 명확화가 완료되었는지 여부
     return Command(
         update={
             "messages": messages,
