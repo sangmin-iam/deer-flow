@@ -243,14 +243,26 @@ def planner_node(
 ) -> Command[Literal["human_feedback", "reporter"]]:
     """Planner node that generate the full plan."""
     logger.info("Planner generating full plan with locale: %s", state.get("locale", "en-US"))
+
+    # ============================================================
+    # 1. 초기화: 설정 로드 및 현재 계획 반복 횟수 확인
+    # - configurable: 설정 파일의 값들 (max_plan_iterations, enable_deep_thinking 등)
+    # - plan_iterations: 현재까지 몇 번 계획을 생성했는지 (재계획 횟수)
+    # ============================================================
     configurable = Configuration.from_runnable_config(config)
     plan_iterations = state["plan_iterations"] if state.get("plan_iterations", 0) else 0
 
-    # For clarification feature: use the clarified research topic (complete history)
+    # ============================================================
+    # 2. 명확화(Clarification) 모드 분기 처리
+    # - 명확화 활성화 시: 정제된 주제만 사용 (대화 이력 제외)
+    # - 명확화 비활성화 시: 전체 대화 이력 사용
+    # ============================================================
     if state.get("enable_clarification", False) and state.get(
         "clarified_research_topic"
     ):
-        # Modify state to use clarified research topic instead of full conversation
+        # 명확화 모드: clarified_research_topic만 사용
+        # - 여러 라운드의 명확화를 거쳐 정제된 완전한 주제
+        # - 전체 대화 이력 대신 정제된 주제만 전달하여 LLM 집중도 향상
         modified_state = state.copy()
         modified_state["messages"] = [
             {"role": "user", "content": state["clarified_research_topic"]}
@@ -262,9 +274,14 @@ def planner_node(
             f"Clarification mode: Using clarified research topic: {state['clarified_research_topic']}"
         )
     else:
-        # Normal mode: use full conversation history
+        # 일반 모드: 전체 대화 히스토리 사용
         messages = apply_prompt_template("planner", state, configurable, state.get("locale", "en-US"))
 
+    # ============================================================
+    # 3. 배경 조사(Background Investigation) 결과 추가
+    # - background_investigator 노드에서 수집한 초기 정보 제공
+    # - Planner가 더 나은 계획을 세울 수 있도록 컨텍스트 제공
+    # ============================================================
     if state.get("enable_background_investigation") and state.get(
         "background_investigation_results"
     ):
@@ -279,6 +296,12 @@ def planner_node(
             }
         ]
 
+    # ============================================================
+    # 4. LLM 타입 선택
+    # - Deep Thinking 모드: reasoning LLM 사용 (더 깊은 사고)
+    # - Basic 모드: structured_output으로 JSON 강제
+    # - 기타: 설정된 Planner LLM 사용
+    # ============================================================
     if configurable.enable_deep_thinking:
         llm = get_llm_by_type("reasoning")
     elif AGENT_LLM_MAP["planner"] == "basic":
@@ -289,44 +312,77 @@ def planner_node(
     else:
         llm = get_llm_by_type(AGENT_LLM_MAP["planner"])
 
-    # if the plan iterations is greater than the max plan iterations, return the reporter node
+    # ============================================================
+    # 5. 최대 계획 반복 횟수 체크
+    # - max_plan_iterations를 초과하면 더 이상 재계획하지 않고 reporter로 이동
+    # - 무한 루프 방지 및 리소스 절약
+    # ============================================================
     if plan_iterations >= configurable.max_plan_iterations:
         return Command(
             update=preserve_state_meta_fields(state),
             goto="reporter"
         )
 
+    # ============================================================
+    # 6. LLM 호출 및 응답 수집
+    # - Basic 모드 (deep thinking 아님): invoke로 한 번에 받기
+    # - 기타: stream으로 응답을 점진적으로 받기
+    # ============================================================
     full_response = ""
     if AGENT_LLM_MAP["planner"] == "basic" and not configurable.enable_deep_thinking:
+        # structured_output 사용: 직접 Plan 객체로 반환
         response = llm.invoke(messages)
+        print('===============================================')
+        print('response: ', response)
+        print('===============================================')
         full_response = response.model_dump_json(indent=4, exclude_none=True)
     else:
+        # 스트리밍: 응답을 점진적으로 수집
         response = llm.stream(messages)
         for chunk in response:
             full_response += chunk.content
     logger.debug(f"Current state messages: {state['messages']}")
     logger.info(f"Planner response: {full_response}")
 
+    # ============================================================
+    # 7. JSON 파싱 및 오류 처리
+    # - LLM 응답(문자열)을 JSON으로 파싱
+    # - repair_json_output: 손상된 JSON 복구 시도
+    # - 파싱 실패 시: reporter 또는 종료로 이동
+    # ============================================================
     try:
         curr_plan = json.loads(repair_json_output(full_response))
     except json.JSONDecodeError:
         logger.warning("Planner response is not a valid JSON")
         if plan_iterations > 0:
+            # 재계획 중이었으면 reporter로 이동 (최선을 다했음)
             return Command(
                 update=preserve_state_meta_fields(state),
                 goto="reporter"
             )
         else:
+            # 첫 계획부터 실패하면 종료
             return Command(
                 update=preserve_state_meta_fields(state),
                 goto="__end__"
             )
 
-    # Validate and fix plan to ensure web search requirements are met
+    # ============================================================
+    # 8. 계획 검증 및 수정
+    # - enforce_web_search: 최소 1개 이상의 웹 검색 단계 강제
+    # - validate_and_fix_plan: 계획의 유효성 검사 및 자동 수정
+    # ============================================================
     if isinstance(curr_plan, dict):
         curr_plan = validate_and_fix_plan(curr_plan, configurable.enforce_web_search)
 
+    # ============================================================
+    # 9. 충분한 컨텍스트 체크 및 라우팅 결정
+    # - has_enough_context=True: 즉시 reporter로 이동 (보고서 작성)
+    # - has_enough_context=False: human_feedback으로 이동 (사용자 승인 필요)
+    # ============================================================
     if isinstance(curr_plan, dict) and curr_plan.get("has_enough_context"):
+        # LLM이 "이미 충분한 정보가 있어"라고 판단
+        # 추가 조사 없이 바로 보고서 작성
         logger.info("Planner response has enough context.")
         new_plan = Plan.model_validate(curr_plan)
         return Command(
@@ -337,6 +393,8 @@ def planner_node(
             },
             goto="reporter",
         )
+    
+    # 기본: human_feedback으로 이동 (사용자가 계획 승인/수정)
     return Command(
         update={
             "messages": [AIMessage(content=full_response, name="planner")],
@@ -350,13 +408,29 @@ def planner_node(
 def human_feedback_node(
     state: State, config: RunnableConfig
 ) -> Command[Literal["planner", "research_team", "reporter", "__end__"]]:
+    """Handle user feedback on the generated plan."""
+    
+    # ============================================================
+    # 1. 초기화 및 자동 승인 체크
+    # - current_plan: Planner가 생성한 계획
+    # - auto_accepted_plan: 자동 승인 여부 확인
+    # ============================================================
     current_plan = state.get("current_plan", "")
-    # check if the plan is auto accepted
     auto_accepted_plan = state.get("auto_accepted_plan", False)
+    
+    # ============================================================
+    # 2. 사용자 피드백 수집 (자동 승인이 아닌 경우)
+    # - interrupt(): 워크플로를 중단하고 사용자 입력 대기
+    # - 사용자가 계획을 검토하고 승인/거부/수정 요청
+    # ============================================================
     if not auto_accepted_plan:
         feedback = interrupt("Please Review the Plan.")
 
-        # Handle None or empty feedback
+        # ============================================================
+        # 3. 빈 피드백 처리
+        # - None이나 빈 문자열인 경우
+        # - Planner로 돌아가서 새로운 계획 생성
+        # ============================================================
         if not feedback:
             logger.warning(f"Received empty or None feedback: {feedback}. Returning to planner for new plan.")
             return Command(
@@ -364,12 +438,24 @@ def human_feedback_node(
                 goto="planner"
             )
 
-        # Normalize feedback string
+        # ============================================================
+        # 4. 피드백 정규화
+        # - 문자열로 변환하고 공백 제거 및 대문자화
+        # - "[ACCEPTED]", "[EDIT_PLAN]" 등의 명령어 인식 준비
+        # ============================================================
+        print("===============================================")
+        print('feedback: ', feedback)
+        print("===============================================")
         feedback_normalized = str(feedback).strip().upper()
 
-        # if the feedback is not accepted, return the planner node
+        # ============================================================
+        # 5. 피드백 타입별 처리
+        # ============================================================
+        
+        # 케이스 1: 계획 수정 요청 ("[EDIT_PLAN] ...")
         if feedback_normalized.startswith("[EDIT_PLAN]"):
             logger.info(f"Plan edit requested by user: {feedback}")
+            # 사용자 피드백을 메시지로 추가하고 Planner로 돌아감
             return Command(
                 update={
                     "messages": [
@@ -377,53 +463,94 @@ def human_feedback_node(
                     ],
                     **preserve_state_meta_fields(state),
                 },
-                goto="planner",
+                goto="planner",  # Planner가 피드백을 반영하여 재계획
             )
+        
+        # 케이스 2: 계획 승인 ("[ACCEPTED]")
         elif feedback_normalized.startswith("[ACCEPTED]"):
             logger.info("Plan is accepted by user.")
+            # 아래로 계속 진행 (계획 실행)
+        
+        # 케이스 3: 잘못된 형식
         else:
             logger.warning(f"Unsupported feedback format: {feedback}. Please use '[ACCEPTED]' to accept or '[EDIT_PLAN]' to edit.")
+            # Planner로 돌아가서 다시 시도
             return Command(
                 update=preserve_state_meta_fields(state),
                 goto="planner"
             )
 
-    # if the plan is accepted, run the following node
+    # ============================================================
+    # 6. 계획 승인 후 처리 (자동 승인 또는 사용자 승인 후)
+    # - plan_iterations: 계획 반복 횟수 증가
+    # - goto: 기본적으로 research_team으로 이동
+    # ============================================================
     plan_iterations = state["plan_iterations"] if state.get("plan_iterations", 0) else 0
     goto = "research_team"
+
+    # ============================================================
+    # 7. 계획 JSON 파싱 및 검증
+    # - repair_json_output: 손상된 JSON 복구 시도
+    # - validate_and_fix_plan: 웹 검색 요구사항 강제 등
+    # ============================================================
     try:
         current_plan = repair_json_output(current_plan)
-        # increment the plan iterations
+        # 계획 반복 횟수 증가
         plan_iterations += 1
-        # parse the plan
+        # JSON 파싱
         new_plan = json.loads(current_plan)
-        # Validate and fix plan to ensure web search requirements are met
+        print("===============================================")
+        print('new_plan: ', new_plan)
+        print("===============================================")
+        # 계획 검증 및 수정 (enforce_web_search 등)
         configurable = Configuration.from_runnable_config(config)
         new_plan = validate_and_fix_plan(new_plan, configurable.enforce_web_search)
     except json.JSONDecodeError:
+        # ============================================================
+        # 8. JSON 파싱 실패 처리
+        # - plan_iterations > 1: 여러 번 시도했으면 reporter로 이동
+        # - 첫 시도: 워크플로 종료
+        # ============================================================
         logger.warning("Planner response is not a valid JSON")
-        if plan_iterations > 1:  # the plan_iterations is increased before this check
+        if plan_iterations > 1:  # 재시도 후에도 실패
             return Command(
                 update=preserve_state_meta_fields(state),
-                goto="reporter"
+                goto="reporter"  # 최선을 다했으니 보고서 작성
             )
-        else:
+        else:  # 첫 시도부터 실패
             return Command(
                 update=preserve_state_meta_fields(state),
-                goto="__end__"
+                goto="__end__"  # 워크플로 종료
             )
 
-    # Build update dict with safe locale handling
+    # ============================================================
+    # 9. State 업데이트 준비
+    # - current_plan: 파싱된 Plan 객체로 변환
+    # - plan_iterations: 증가된 반복 횟수
+    # - 메타 필드 보존
+    # ============================================================
     update_dict = {
         "current_plan": Plan.model_validate(new_plan),
         "plan_iterations": plan_iterations,
         **preserve_state_meta_fields(state),
     }
     
-    # Only override locale if new_plan provides a valid value, otherwise use preserved locale
+    # ============================================================
+    # 10. Locale 안전 처리
+    # - new_plan에 locale이 있으면 사용
+    # - 없으면 preserve_state_meta_fields의 locale 사용 (덮어쓰지 않음)
+    # ============================================================
     if new_plan.get("locale"):
         update_dict["locale"] = new_plan["locale"]
+
+    print("===============================================")
+    print('update_dict: ', update_dict)
+    print("===============================================")
     
+    # ============================================================
+    # 11. 최종 Command 반환
+    # - research_team으로 이동하여 계획 실행 시작
+    # ============================================================
     return Command(
         update=update_dict,
         goto=goto,
@@ -476,9 +603,9 @@ def coordinator_node(
             .invoke(messages)
         )
 
-        print('===============================================')
-        print('response: ', response)
-        print('===============================================')
+        # print('===============================================')
+        # print('response: ', response)
+        # print('===============================================')
 
         goto = "__end__"
         locale = state.get("locale", "en-US")
@@ -1050,6 +1177,7 @@ async def _setup_and_execute_agent_step(
             pre_model_hook,
             interrupt_before_tools=configurable.interrupt_before_tools,
         )
+        
         return await _execute_agent_step(state, agent, agent_type)
 
 

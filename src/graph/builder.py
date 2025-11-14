@@ -21,7 +21,6 @@ from .types import State
 
 def continue_to_running_research_team(state: State):
     current_plan = state.get("current_plan")
-    print('current_plan: ', current_plan)
     if not current_plan or not current_plan.steps:
         return "planner"
 
